@@ -23,6 +23,7 @@ use crate::cross_domain::CrossDomain;
 #[cfg(feature = "gfxstream")]
 use crate::gfxstream::Gfxstream;
 use crate::handle::RutabagaHandle;
+#[cfg(feature = "magma")]
 use crate::magma::MagmaVirtioGpu;
 use crate::rutabaga_2d::Rutabaga2D;
 use crate::rutabaga_utils::GfxstreamFlags;
@@ -374,6 +375,11 @@ const RUTABAGA_CAPSETS: [RutabagaCapsetInfo; 9] = [
     },
 ];
 
+const CONTEXT_BLOB_COMPONENTS: [RutabagaComponentType; 2] = [
+    RutabagaComponentType::CrossDomain,
+    RutabagaComponentType::Magma,
+];
+
 pub fn calculate_capset_mask<'a, I: Iterator<Item = &'a str>>(context_names: I) -> u64 {
     let mut capset_mask = 0;
     for name in context_names {
@@ -404,6 +410,7 @@ fn calculate_component(component_mask: u8) -> RutabagaResult<RutabagaComponentTy
         2 => Ok(RutabagaComponentType::VirglRenderer),
         3 => Ok(RutabagaComponentType::Gfxstream),
         4 => Ok(RutabagaComponentType::CrossDomain),
+        5 => Ok(RutabagaComponentType::Magma),
         _ => Err(RutabagaError::InvalidComponent),
     }
 }
@@ -865,7 +872,7 @@ impl Rutabaga {
                 .get_mut(&ctx_id)
                 .ok_or(RutabagaError::InvalidContextId)?;
 
-            if ctx.component_type() == RutabagaComponentType::CrossDomain {
+            if CONTEXT_BLOB_COMPONENTS.contains(&ctx.component_type()) {
                 context = Some(ctx);
             }
         }
@@ -1429,6 +1436,7 @@ impl RutabagaBuilder {
                 push_capset(RUTABAGA_CAPSET_GFXSTREAM_COMPOSER);
             }
 
+            #[cfg(feature = "magma")]
             if capset_enabled(RUTABAGA_CAPSET_MAGMA) {
                 let magma = MagmaVirtioGpu::init(self.fence_handler.clone())?;
                 rutabaga_components.insert(RutabagaComponentType::Magma, magma);

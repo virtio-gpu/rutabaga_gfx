@@ -1,0 +1,601 @@
+// Copyright 2026 The Magma GPU Project
+// SPDX-License-Identifier: MIT
+
+use std::os::fd::AsFd;
+use std::os::fd::BorrowedFd;
+use std::sync::Arc;
+
+use log::error;
+
+use magma_gpu::log_status;
+use magma_gpu::util::Error as MagmaGpuError;
+use magma_gpu::util::Handle as MagmaGpuHandle;
+use magma_gpu::util::MappedRegion;
+use magma_gpu::util::OwnedDescriptor;
+use magma_gpu::util::Result as MagmaGpuResult;
+
+use zerocopy::FromZeros;
+use zerocopy::KnownLayout;
+
+use crate::magma_defines::MagmaCreateBufferInfo;
+use crate::magma_defines::MagmaCreateQueueInfo;
+use crate::magma_defines::MagmaHeapBudget;
+use crate::magma_defines::MagmaImportHandleInfo;
+use crate::magma_defines::MagmaMemoryProperties;
+use crate::magma_defines::MagmaPhysicalDeviceInfo;
+use crate::magma_defines::MagmaQueueFamilyProperties;
+use crate::magma_defines::MagmaQueueFlags;
+use crate::magma_defines::MagmaSubmitInfo;
+use crate::magma_defines::MAGMA_HEAP_CPU_VISIBLE_BIT;
+use crate::magma_defines::MAGMA_HEAP_DEVICE_LOCAL_BIT;
+use crate::magma_defines::MAGMA_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+use crate::magma_defines::MAGMA_MEMORY_PROPERTY_HOST_CACHED_BIT;
+use crate::magma_defines::MAGMA_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+use crate::magma_defines::MAGMA_MEMORY_PROPERTY_HOST_VISIBLE_BIT;
+
+use crate::ioctl_readwrite;
+use crate::ioctl_write_ptr;
+
+use crate::sys::linux::bindings::drm_bindings::DRM_COMMAND_BASE;
+use crate::sys::linux::bindings::drm_bindings::DRM_IOCTL_BASE;
+use crate::sys::linux::bindings::i915_bindings::*;
+use crate::sys::linux::PlatformDevice;
+use crate::sys::linux::PlatformPhysicalDevice;
+
+use crate::traits::AddressSpace;
+use crate::traits::AsVirtGpu;
+use crate::traits::Buffer;
+use crate::traits::Device;
+use crate::traits::GenericAddressSpace;
+use crate::traits::GenericBuffer;
+use crate::traits::GenericDevice;
+use crate::traits::GenericPhysicalDevice;
+use crate::traits::GenericQueue;
+use crate::traits::PhysicalDevice;
+use crate::traits::Queue;
+
+ioctl_readwrite!(
+    drm_ioctl_i915_getparam,
+    DRM_IOCTL_BASE,
+    DRM_COMMAND_BASE + DRM_I915_GETPARAM,
+    drm_i915_getparam
+);
+
+ioctl_readwrite!(
+    drm_ioctl_i915_query,
+    DRM_IOCTL_BASE,
+    DRM_COMMAND_BASE + DRM_I915_QUERY,
+    drm_i915_query
+);
+
+ioctl_readwrite!(
+    drm_ioctl_i915_gem_create,
+    DRM_IOCTL_BASE,
+    DRM_COMMAND_BASE + DRM_I915_GEM_CREATE,
+    drm_i915_gem_create
+);
+
+ioctl_readwrite!(
+    drm_ioctl_i915_gem_mmap_offset,
+    DRM_IOCTL_BASE,
+    DRM_COMMAND_BASE + DRM_I915_GEM_MMAP_GTT,
+    drm_i915_gem_mmap_offset
+);
+
+ioctl_readwrite!(
+    drm_ioctl_i915_gem_context_create_ext,
+    DRM_IOCTL_BASE,
+    DRM_COMMAND_BASE + DRM_I915_GEM_CONTEXT_CREATE,
+    drm_i915_gem_context_create_ext
+);
+
+ioctl_write_ptr!(
+    drm_ioctl_i915_gem_context_destroy,
+    DRM_IOCTL_BASE,
+    DRM_COMMAND_BASE + DRM_I915_GEM_CONTEXT_DESTROY,
+    drm_i915_gem_context_destroy
+);
+
+ioctl_readwrite!(
+    drm_ioctl_i915_gem_execbuffer2,
+    DRM_IOCTL_BASE,
+    DRM_COMMAND_BASE + DRM_I915_GEM_EXECBUFFER2_WR,
+    drm_i915_gem_execbuffer2
+);
+
+#[derive(Default)]
+struct I915MemoryInfo {
+    sysmem_total: u64,
+    sysmem_free: u64,
+    vram_mappable_total: u64,
+    vram_mappable_free: u64,
+    vram_unmappable_total: u64,
+    vram_unmappable_free: u64,
+}
+
+fn i915_query<T, S, H>(fd: BorrowedFd<'_>, query_id: u32) -> MagmaGpuResult<Box<T>>
+where
+    T: ?Sized + FromZeros + KnownLayout<PointerMetadata = usize>,
+{
+    let mut item = drm_i915_query_item {
+        query_id: query_id as u64,
+        length: 0,
+        flags: 0,
+        data_ptr: 0,
+    };
+
+    let mut query = drm_i915_query {
+        num_items: 1,
+        flags: 0,
+        items_ptr: &mut item as *mut _ as u64,
+    };
+
+    // SAFETY: First call to get the size
+    unsafe {
+        drm_ioctl_i915_query(fd, &mut query)?;
+    }
+
+    if item.length < 0 {
+        return Err(MagmaGpuError::from(std::io::Error::from_raw_os_error(
+            -item.length,
+        )));
+    }
+
+    let total_size = item.length as usize;
+    let header_size = std::mem::size_of::<H>();
+    let element_size = std::mem::size_of::<S>();
+    let count = total_size
+        .saturating_sub(header_size)
+        .div_ceil(element_size);
+
+    let mut query_data = T::new_box_zeroed_with_elems(count)
+        .map_err(|_| MagmaGpuError::WithContext("Failed to allocate query data"))?;
+
+    item.data_ptr = &mut *query_data as *mut T as *mut () as u64;
+
+    // SAFETY: Second call to get the data
+    unsafe {
+        drm_ioctl_i915_query(fd, &mut query)?;
+    }
+
+    Ok(query_data)
+}
+
+fn i915_query_memory_regions(fd: BorrowedFd<'_>) -> MagmaGpuResult<I915MemoryInfo> {
+    let query_mem_regions = i915_query::<
+        drm_i915_query_memory_regions<[drm_i915_memory_region_info]>,
+        drm_i915_memory_region_info,
+        drm_i915_query_memory_regions<[drm_i915_memory_region_info; 0]>,
+    >(fd, DRM_I915_QUERY_MEMORY_REGIONS)?;
+
+    let num_regions = std::cmp::min(
+        query_mem_regions.num_regions as usize,
+        query_mem_regions.regions.len(),
+    );
+    let regions = &query_mem_regions.regions[..num_regions];
+    let mut info = I915MemoryInfo::default();
+
+    for region in regions {
+        // SAFETY: Accessing a C union's fields is unsafe in Rust.
+        let (probed_cpu_visible_size, unallocated_cpu_visible_size) = unsafe {
+            (
+                region
+                    .__bindgen_anon_1
+                    .__bindgen_anon_1
+                    .probed_cpu_visible_size,
+                region
+                    .__bindgen_anon_1
+                    .__bindgen_anon_1
+                    .unallocated_cpu_visible_size,
+            )
+        };
+
+        match region.region.memory_class as u32 {
+            I915_MEMORY_CLASS_SYSTEM => {
+                info.sysmem_total = region.probed_size;
+                info.sysmem_free = region.unallocated_size;
+            }
+            I915_MEMORY_CLASS_DEVICE => {
+                if probed_cpu_visible_size > 0 {
+                    info.vram_mappable_total = probed_cpu_visible_size;
+                    info.vram_unmappable_total = region.probed_size - probed_cpu_visible_size;
+                    if region.unallocated_size != u64::MAX {
+                        info.vram_mappable_free = unallocated_cpu_visible_size;
+                        info.vram_unmappable_free =
+                            region.unallocated_size - unallocated_cpu_visible_size;
+                    }
+                } else {
+                    info.vram_mappable_total = region.probed_size;
+                    info.vram_unmappable_total = 0;
+                    if region.unallocated_size != u64::MAX {
+                        info.vram_mappable_free = region.unallocated_size;
+                        info.vram_unmappable_free = 0;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(info)
+}
+
+#[derive(Debug)]
+pub struct I915PhysicalDevice {
+    descriptor: OwnedDescriptor,
+}
+
+impl I915PhysicalDevice {
+    pub fn new(descriptor: OwnedDescriptor) -> Self {
+        Self { descriptor }
+    }
+}
+
+impl PlatformPhysicalDevice for I915PhysicalDevice {
+    fn as_descriptor(&self) -> Option<&OwnedDescriptor> {
+        Some(&self.descriptor)
+    }
+}
+
+impl AsVirtGpu for I915PhysicalDevice {}
+impl PhysicalDevice for I915PhysicalDevice {}
+unsafe impl Send for I915PhysicalDevice {}
+unsafe impl Sync for I915PhysicalDevice {}
+
+impl GenericPhysicalDevice for I915PhysicalDevice {
+    fn create_device(
+        self: Arc<Self>,
+        _info: &MagmaPhysicalDeviceInfo,
+    ) -> MagmaGpuResult<Arc<dyn Device>> {
+        Ok(Arc::new(I915::new(self)?))
+    }
+
+    fn query_memory_properties(&self) -> MagmaGpuResult<MagmaMemoryProperties> {
+        i915_query_memory_properties(self.descriptor.as_fd())
+    }
+
+    fn query_queue_family_properties(&self) -> MagmaGpuResult<Vec<MagmaQueueFamilyProperties>> {
+        Ok(vec![MagmaQueueFamilyProperties::new(
+            MagmaQueueFlags::Graphics | MagmaQueueFlags::Compute,
+            1,
+        )])
+    }
+}
+
+pub struct I915 {
+    physical_device: Arc<dyn PhysicalDevice>,
+    mem_props: MagmaMemoryProperties,
+}
+
+struct I915AddressSpace {
+    _physical_device: Arc<dyn PhysicalDevice>,
+}
+
+impl GenericAddressSpace for I915AddressSpace {}
+impl AddressSpace for I915AddressSpace {}
+
+struct I915Queue {
+    physical_device: Arc<dyn PhysicalDevice>,
+    context_id: u32,
+}
+
+struct I915Buffer {
+    physical_device: Arc<dyn PhysicalDevice>,
+    gem_handle: u32,
+    size: usize,
+}
+
+fn i915_query_memory_properties(fd: BorrowedFd<'_>) -> MagmaGpuResult<MagmaMemoryProperties> {
+    let mem_info = i915_query_memory_regions(fd).unwrap_or_default();
+    let mut mem_props: MagmaMemoryProperties = Default::default();
+
+    if mem_info.sysmem_total > 0 {
+        mem_props.add_heap(mem_info.sysmem_total, MAGMA_HEAP_CPU_VISIBLE_BIT);
+        mem_props.add_memory_type(
+            MAGMA_MEMORY_PROPERTY_HOST_COHERENT_BIT
+                | MAGMA_MEMORY_PROPERTY_HOST_VISIBLE_BIT
+                | MAGMA_MEMORY_PROPERTY_HOST_CACHED_BIT,
+        );
+        mem_props.increment_heap_count();
+    }
+
+    if mem_info.vram_mappable_total > 0 {
+        mem_props.add_heap(
+            mem_info.vram_mappable_total,
+            MAGMA_HEAP_CPU_VISIBLE_BIT | MAGMA_HEAP_DEVICE_LOCAL_BIT,
+        );
+        mem_props.add_memory_type(
+            MAGMA_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | MAGMA_MEMORY_PROPERTY_HOST_VISIBLE_BIT,
+        );
+        mem_props.increment_heap_count();
+    }
+
+    if mem_info.vram_unmappable_total > 0 {
+        mem_props.add_heap(mem_info.vram_unmappable_total, MAGMA_HEAP_DEVICE_LOCAL_BIT);
+        mem_props.add_memory_type(MAGMA_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        mem_props.increment_heap_count();
+    }
+
+    if mem_props.memory_heap_count == 0 {
+        // Fallback for older kernels
+        mem_props.add_heap(4 * 1024 * 1024 * 1024, MAGMA_HEAP_CPU_VISIBLE_BIT);
+        mem_props.add_memory_type(
+            MAGMA_MEMORY_PROPERTY_HOST_COHERENT_BIT
+                | MAGMA_MEMORY_PROPERTY_HOST_VISIBLE_BIT
+                | MAGMA_MEMORY_PROPERTY_HOST_CACHED_BIT,
+        );
+        mem_props.increment_heap_count();
+    }
+
+    Ok(mem_props)
+}
+
+impl I915 {
+    pub fn new(physical_device: Arc<dyn PhysicalDevice>) -> MagmaGpuResult<I915> {
+        let fd = physical_device
+            .as_fd()
+            .ok_or(MagmaGpuError::WithContext("no fd"))?;
+        let mut val: i32 = 0;
+        let mut getparam = drm_i915_getparam {
+            param: I915_PARAM_HAS_ALIASING_PPGTT as i32,
+            value: &mut val as *mut _,
+        };
+
+        // SAFETY: This is a well-formed ioctl conforming the driver specificiation.
+        unsafe {
+            drm_ioctl_i915_getparam(fd, &mut getparam)?;
+        }
+
+        let mem_props = physical_device.query_memory_properties()?;
+
+        Ok(I915 {
+            physical_device,
+            mem_props,
+        })
+    }
+}
+
+impl GenericDevice for I915 {
+    fn get_memory_budget(&self, heap_idx: u32) -> MagmaGpuResult<MagmaHeapBudget> {
+        if heap_idx >= self.mem_props.memory_heap_count {
+            return Err(MagmaGpuError::WithContext("Heap Index out of bounds"));
+        }
+
+        let fd = self
+            .physical_device
+            .as_fd()
+            .ok_or(MagmaGpuError::WithContext("no fd"))?;
+        let mem_info = i915_query_memory_regions(fd)?;
+        let heap = &self.mem_props.memory_heaps[heap_idx as usize];
+
+        let (budget, free) = if heap.is_cpu_visible() && !heap.is_device_local() {
+            (mem_info.sysmem_total, mem_info.sysmem_free)
+        } else if heap.is_cpu_visible() && heap.is_device_local() {
+            (mem_info.vram_mappable_total, mem_info.vram_mappable_free)
+        } else if !heap.is_cpu_visible() && heap.is_device_local() {
+            (
+                mem_info.vram_unmappable_total,
+                mem_info.vram_unmappable_free,
+            )
+        } else {
+            return Err(MagmaGpuError::Unsupported);
+        };
+
+        Ok(MagmaHeapBudget {
+            budget,
+            usage: budget - free,
+        })
+    }
+
+    fn create_address_space(self: Arc<Self>) -> MagmaGpuResult<Arc<dyn AddressSpace>> {
+        Ok(Arc::new(I915AddressSpace {
+            _physical_device: self.physical_device.clone(),
+        }))
+    }
+
+    fn create_queue(
+        self: Arc<Self>,
+        _address_space: &Arc<dyn AddressSpace>,
+        _info: &MagmaCreateQueueInfo,
+    ) -> MagmaGpuResult<Arc<dyn Queue>> {
+        let queue = I915Queue::new(self.physical_device.clone())?;
+        Ok(Arc::new(queue))
+    }
+
+    fn create_buffer(
+        self: Arc<Self>,
+        create_info: &MagmaCreateBufferInfo,
+    ) -> MagmaGpuResult<Arc<dyn Buffer>> {
+        let buf = I915Buffer::new(self.physical_device.clone(), create_info)?;
+        Ok(Arc::new(buf))
+    }
+
+    fn import(self: Arc<Self>, info: MagmaImportHandleInfo) -> MagmaGpuResult<Arc<dyn Buffer>> {
+        let gem_handle = self.physical_device.import(info.handle)?;
+        let buf = I915Buffer::from_existing(
+            self.physical_device.clone(),
+            gem_handle,
+            info.size.try_into()?,
+        )?;
+        Ok(Arc::new(buf))
+    }
+}
+
+impl Device for I915 {}
+impl PlatformDevice for I915 {}
+
+impl I915Queue {
+    fn new(physical_device: Arc<dyn PhysicalDevice>) -> MagmaGpuResult<I915Queue> {
+        let mut ctx_create = drm_i915_gem_context_create_ext::default();
+
+        // SAFETY:
+        // Valid arguments are supplied for the following arguments:
+        //   - Underlying descriptor
+        //   - drm_i915_gem_context_create_ext struct
+        unsafe {
+            drm_ioctl_i915_gem_context_create_ext(
+                physical_device.as_fd().unwrap(),
+                &mut ctx_create,
+            )?;
+        };
+
+        Ok(I915Queue {
+            physical_device,
+            context_id: ctx_create.ctx_id,
+        })
+    }
+}
+
+impl Drop for I915Queue {
+    fn drop(&mut self) {
+        let ctx_destroy = drm_i915_gem_context_destroy {
+            ctx_id: self.context_id,
+            pad: 0,
+        };
+
+        // SAFETY:
+        // Valid arguments are supplied for the following arguments:
+        //   - Underlying descriptor
+        //   - drm_i915_gem_context_destroy struct
+        let result = unsafe {
+            drm_ioctl_i915_gem_context_destroy(self.physical_device.as_fd().unwrap(), &ctx_destroy)
+        };
+        log_status!(result);
+    }
+}
+
+impl GenericQueue for I915Queue {
+    fn submit_command(&self, submit_info: &MagmaSubmitInfo) -> MagmaGpuResult<()> {
+        let buf_info = submit_info
+            .buffer_info()
+            .ok_or(MagmaGpuError::Unsupported)?;
+
+        let mut obj = drm_i915_gem_exec_object2 {
+            handle: buf_info.command_buffer,
+            ..Default::default()
+        };
+
+        let mut exec = drm_i915_gem_execbuffer2 {
+            buffers_ptr: &mut obj as *mut _ as u64,
+            buffer_count: 1,
+            batch_start_offset: buf_info.start_offset as u32,
+            batch_len: buf_info.length as u32,
+            flags: I915_EXEC_RENDER as u64,
+            rsvd1: self.context_id as u64,
+            ..Default::default()
+        };
+
+        unsafe {
+            drm_ioctl_i915_gem_execbuffer2(self.physical_device.as_fd().unwrap(), &mut exec)?;
+        }
+        Ok(())
+    }
+}
+
+impl Queue for I915Queue {}
+
+impl I915Buffer {
+    fn new(
+        physical_device: Arc<dyn PhysicalDevice>,
+        create_info: &MagmaCreateBufferInfo,
+    ) -> MagmaGpuResult<I915Buffer> {
+        let mut gem_create = drm_i915_gem_create {
+            size: create_info.size,
+            handle: 0,
+            pad: 0,
+        };
+
+        // SAFETY:
+        // Valid arguments are supplied for the following arguments:
+        //   - Underlying descriptor
+        //   - drm_i915_gem_create struct
+        unsafe {
+            drm_ioctl_i915_gem_create(physical_device.as_fd().unwrap(), &mut gem_create)?;
+        };
+
+        Ok(I915Buffer {
+            physical_device,
+            gem_handle: gem_create.handle,
+            size: create_info.size.try_into()?,
+        })
+    }
+
+    fn from_existing(
+        physical_device: Arc<dyn PhysicalDevice>,
+        gem_handle: u32,
+        size: usize,
+    ) -> MagmaGpuResult<I915Buffer> {
+        Ok(I915Buffer {
+            physical_device,
+            gem_handle,
+            size,
+        })
+    }
+}
+
+impl GenericBuffer for I915Buffer {
+    fn map(self: Arc<Self>) -> MagmaGpuResult<Arc<dyn MappedRegion>> {
+        let mut gem_mmap = drm_i915_gem_mmap_offset {
+            handle: self.gem_handle,
+            pad: 0,
+            offset: 0,
+            flags: I915_MMAP_OFFSET_WC as u64,
+            extensions: 0,
+        };
+
+        // SAFETY:
+        // Valid arguments are supplied for the following arguments:
+        //   - Underlying descriptor
+        //   - drm_i915_gem_mmap_offset struct
+        let offset = unsafe {
+            drm_ioctl_i915_gem_mmap_offset(self.physical_device.as_fd().unwrap(), &mut gem_mmap)?;
+            gem_mmap.offset
+        };
+
+        let mapping = self.physical_device.cpu_map(offset, self.size)?;
+        Ok(Arc::new(mapping))
+    }
+
+    fn export(&self) -> MagmaGpuResult<MagmaGpuHandle> {
+        self.physical_device.export(self.gem_handle)
+    }
+
+    fn invalidate(
+        &self,
+        _sync_flags: u64,
+        _ranges: &[crate::magma_defines::MagmaMappedMemoryRange],
+    ) -> MagmaGpuResult<()> {
+        Err(MagmaGpuError::Unsupported)
+    }
+
+    fn flush(
+        &self,
+        _sync_flags: u64,
+        _ranges: &[crate::magma_defines::MagmaMappedMemoryRange],
+    ) -> MagmaGpuResult<()> {
+        Err(MagmaGpuError::Unsupported)
+    }
+
+    fn as_gem_handle(&self) -> Option<u32> {
+        Some(self.gem_handle)
+    }
+}
+
+impl Drop for I915Buffer {
+    fn drop(&mut self) {
+        self.physical_device.close(self.gem_handle);
+    }
+}
+
+impl Buffer for I915Buffer {}
+
+unsafe impl Send for I915 {}
+unsafe impl Sync for I915 {}
+
+unsafe impl Send for I915AddressSpace {}
+unsafe impl Sync for I915AddressSpace {}
+
+unsafe impl Send for I915Queue {}
+unsafe impl Sync for I915Queue {}
+
+unsafe impl Send for I915Buffer {}
+unsafe impl Sync for I915Buffer {}
